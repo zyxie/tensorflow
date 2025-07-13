@@ -122,6 +122,12 @@ ThreadPool::ThreadPool(Env* env, const ThreadOptions& thread_options,
                        bool low_latency_hint, Eigen::Allocator* allocator) {
   CHECK_GE(num_threads, 1);
 
+  env_ = env;
+  thread_options_ = thread_options;
+  name_ = name;
+  low_latency_hint_ = low_latency_hint;
+  allocator_ = allocator;
+
 #ifdef DNNL_AARCH64_USE_ACL
   // To avoid cost of swapping in and out threads from running processes
   // we do not use all available cores to parallelise TF operations.
@@ -145,6 +151,11 @@ ThreadPool::ThreadPool(Env* env, const ThreadOptions& thread_options,
 }
 
 ThreadPool::ThreadPool(thread::ThreadPoolInterface* user_threadpool) {
+  env_ = nullptr;
+  name_.clear();
+  low_latency_hint_ = true;
+  thread_options_ = ThreadOptions();
+  allocator_ = nullptr;
   underlying_threadpool_ = user_threadpool;
   threadpool_device_.reset(new Eigen::ThreadPoolDevice(
       underlying_threadpool_, underlying_threadpool_->NumThreads(), nullptr));
@@ -272,6 +283,17 @@ int ThreadPool::CurrentThreadId() const {
 void ThreadPool::ScheduleWithHint(std::function<void()> fn, int start,
                                   int limit) {
   underlying_threadpool_->ScheduleWithHint(std::move(fn), start, limit);
+}
+
+void ThreadPool::Resize(int num_threads) {
+  if (!eigen_threadpool_) return;  // Can't resize user provided pool.
+
+  eigen_threadpool_.reset(new Eigen::ThreadPoolTempl<EigenEnvironment>(
+      num_threads, low_latency_hint_,
+      EigenEnvironment(env_, thread_options_, "tf_" + name_)));
+  underlying_threadpool_ = eigen_threadpool_.get();
+  threadpool_device_.reset(new Eigen::ThreadPoolDevice(
+      underlying_threadpool_, num_threads, allocator_));
 }
 
 Eigen::ThreadPoolInterface* ThreadPool::AsEigenThreadPool() const {

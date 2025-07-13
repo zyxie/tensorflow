@@ -152,6 +152,11 @@ class ThreadPool {
 
   void ScheduleWithHint(std::function<void()> fn, int start, int limit);
 
+  // Dynamically resizes the thread pool. Only works if the pool
+  // was created internally and not with a user provided
+  // ThreadPoolInterface. Pending work is not waited on.
+  void Resize(int num_threads);
+
   // Returns the number of shards used by ParallelForFixedBlockSizeScheduling
   // with these parameters.
   int NumShardsUsedByFixedBlockSizeScheduling(int64_t total,
@@ -248,6 +253,13 @@ class ThreadPool {
   // user_threadpool is not in the constructor.
   std::unique_ptr<Eigen::ThreadPoolTempl<EigenEnvironment>> eigen_threadpool_;
   std::unique_ptr<Eigen::ThreadPoolDevice> threadpool_device_;
+
+  // Saved parameters needed to recreate the underlying pool on resize.
+  Env* env_ = nullptr;
+  ThreadOptions thread_options_;
+  std::string name_;
+  bool low_latency_hint_ = true;
+  Eigen::Allocator* allocator_ = nullptr;
 
   ThreadPool(const ThreadPool&) = delete;
   void operator=(const ThreadPool&) = delete;
