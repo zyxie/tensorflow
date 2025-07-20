@@ -15,10 +15,10 @@ limitations under the License.
 
 #include "xla/backends/cpu/codegen/fusion_emitter.h"
 
-#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <string>
 #include <utility>
 
 #include "absl/algorithm/container.h"
@@ -27,9 +27,14 @@ limitations under the License.
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "absl/types/span.h"
+#include "llvm/ADT/STLExtras.h"
+#include "mlir/IR/Builders.h"
 #include "mlir/IR/MLIRContext.h"
 #include "xla/backends/cpu/alignment.h"
+#include "xla/backends/cpu/codegen/kernel_api_ir_builder.h"
+#include "xla/backends/cpu/codegen/symbol_name_util.h"
 #include "xla/codegen/emitters/ir/xla_ops.h"
 #include "xla/codegen/emitters/kernel_arguments.h"
 #include "xla/codegen/emitters/loop_kernel_emitter.h"
@@ -38,38 +43,85 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/utils/hlo_traversal.h"
+#include "xla/layout_util.h"
 #include "xla/runtime/work_cluster.h"
 #include "xla/runtime/work_dimensions.h"
 #include "xla/runtime/work_group.h"
 #include "xla/runtime/work_item.h"
+#include "xla/runtime/work_tile_size.h"
 #include "xla/service/buffer_assignment.h"
 #include "xla/service/cpu/backend_config.pb.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
+#include "xla/tsl/platform/statusor.h"
 #include "xla/util.h"
 
 namespace xla::cpu {
 
+static absl::StatusOr<std::string> GetName(const HloFusionInstruction& fusion,
+                                           bool use_unique_c_name) {
+  if (!use_unique_c_name) {
+    return std::string(fusion.name());
+  }
+
+  return ConvertToCName(
+      absl::StrCat(fusion.GetModule()->name(), "_", fusion.name()));
+}
+
 static emitters::KernelArguments::BufferAlignment GetDefaultBufferAlignment() {
   emitters::KernelArguments::BufferAlignment buffer_alignment;
   buffer_alignment.entry_parameter_align_bytes = MinAlign();
-  buffer_alignment.xla_allocated_buffer_align_bytes = Align();
-  buffer_alignment.constant_buffer_align_bytes = Align();
+  buffer_alignment.xla_allocated_buffer_align_bytes = MinAlign();
+  buffer_alignment.constant_buffer_align_bytes = MinAlign();
 
   return buffer_alignment;
 }
 
-static constexpr uint64_t kMaxWorkItems = 1024;
-static constexpr uint64_t kUnrollFactor = 8;
+static int64_t GetWorkGroupCount(const HloFusionInstruction& fusion) {
+  auto backend_config_or = fusion.backend_config<BackendConfig>();
+  if (!backend_config_or.ok()) {
+    return 1;
+  }
+  absl::Span<const int64_t> outer_dimension_partitions =
+      backend_config_or->outer_dimension_partitions();
 
-static WorkDimensions GetDefaultWorkDimensions(uint64_t group_count,
-                                               uint64_t total_item_count) {
-  NumWorkGroups num_work_groups{group_count};
-  NumWorkItems num_work_items{std::min<uint64_t>(
-      kMaxWorkItems,
-      CeilOfRatio(total_item_count, group_count * kUnrollFactor))};
+  if (outer_dimension_partitions.empty()) {
+    return 1;
+  }
 
-  return WorkDimensions{NumWorkClusters(), num_work_groups, num_work_items};
+  return absl::c_accumulate(outer_dimension_partitions, 1,
+                            std::multiplies<int64_t>());
+}
+
+WorkDimensions GetWorkDimensions(const Shape& shape,
+                                 const HloFusionInstruction& fusion) {
+  auto minor_to_major = LayoutUtil::MinorToMajor(shape.layout());
+
+  if (minor_to_major.empty()) {
+    return WorkDimensions{};
+  }
+
+  int64_t work_group_count = GetWorkGroupCount(fusion);
+  NumWorkGroups num_work_groups{static_cast<uint64_t>(work_group_count)};
+
+  WorkTileSize work_tile_size;
+  int64_t folded_dims = 1;
+  for (int64_t dim : llvm::reverse(minor_to_major)) {
+    int64_t dim_size = ShapeUtil::GetDimension(shape, dim);
+    int64_t accumilated_dim_size = folded_dims * dim_size;
+    if (accumilated_dim_size < work_group_count) {
+      folded_dims *= dim_size;
+    } else if (work_group_count != 1) {
+      work_tile_size.dimensions.push_back(
+          CeilOfRatio(accumilated_dim_size, work_group_count));
+      work_group_count = 1;
+    } else {
+      work_tile_size.dimensions.push_back(dim_size);
+    }
+  }
+
+  return WorkDimensions{NumWorkClusters{}, num_work_groups, NumWorkItems{},
+                        work_tile_size};
 }
 
 // Get the work dimensions for the given fusion.
@@ -78,23 +130,8 @@ static WorkDimensions GetLoopEmitterWorkDims(const HloFusionInstruction& fusion,
                                              const HloFusionSpec& fusion_spec) {
   Shape indexing_shape =
       emitters::LoopFusionKernelEmitter::GetIndexingShape(fusion_spec);
-  auto total_item_count = ShapeUtil::ElementsIn(indexing_shape);
 
-  auto backend_config_or = fusion.backend_config<BackendConfig>();
-  if (!backend_config_or.ok()) {
-    return GetDefaultWorkDimensions(1, total_item_count);
-  }
-  absl::Span<const int64_t> outer_dimension_partitions =
-      backend_config_or->outer_dimension_partitions();
-
-  if (outer_dimension_partitions.empty()) {
-    return GetDefaultWorkDimensions(1, total_item_count);
-  }
-
-  int64_t num_groups = absl::c_accumulate(outer_dimension_partitions, 1,
-                                          std::multiplies<int64_t>());
-
-  return GetDefaultWorkDimensions(num_groups, total_item_count);
+  return GetWorkDimensions(indexing_shape, fusion);
 }
 
 static HloFusionSpec GetLoopFusionSpec(const HloFusionInstruction& fusion) {
@@ -117,17 +154,31 @@ static HloFusionSpec GetLoopFusionSpec(const HloFusionInstruction& fusion) {
 
 absl::StatusOr<MlirKernelDefinition> EmitFusionKernel(
     mlir::MLIRContext& context, const HloFusionInstruction& fusion,
-    const BufferAssignment* buffer_assignment) {
+    const BufferAssignment* buffer_assignment, bool use_unique_c_name) {
   if (fusion.fusion_kind() == HloFusionInstruction::FusionKind::kLoop) {
-    VLOG(2) << "Emitting loop fusion kernel: " << fusion.name();
+    TF_ASSIGN_OR_RETURN(std::string name, GetName(fusion, use_unique_c_name));
+    VLOG(2) << "Emitting loop fusion kernel: " << name;
     HloFusionSpec fusion_spec = GetLoopFusionSpec(fusion);
-    WorkDimensions work_dimensions =
-        GetLoopEmitterWorkDims(fusion, fusion_spec);
-    return emitters::LoopFusionKernelEmitter(
-               context, fusion, std::move(fusion_spec), buffer_assignment,
-               GetDefaultBufferAlignment(), work_dimensions, kUnrollFactor,
-               fusion.name(), BackendKind::kCpu)
-        .EmitKernelDefinition();
+    auto work_dimensions = GetLoopEmitterWorkDims(fusion, fusion_spec);
+
+    emitters::LoopFusionKernelEmitter loop_fusion_emitter(
+        context, fusion, std::move(fusion_spec), buffer_assignment,
+        GetDefaultBufferAlignment(), work_dimensions, name, BackendKind::kCpu);
+    TF_ASSIGN_OR_RETURN(auto mlir_kernel_definition,
+                        loop_fusion_emitter.EmitKernelDefinition());
+
+    // We have to release otherwise the source wouldn't be mutable, and we
+    // wouldn't be able to set the CpuMemoryRegionNameAttr.
+    auto [kernel_spec, kernel_source] =
+        std::move(mlir_kernel_definition).ReleaseStorage();
+
+    mlir::OpBuilder builder(&context);
+    kernel_source.module().getOperation()->setAttr(
+        xla::CpuMemoryRegionNameAttr::name,
+        builder.getStringAttr(
+            BuildModuleMemoryRegionName(loop_fusion_emitter.name(), &fusion)));
+    return MlirKernelDefinition(std::move(kernel_spec),
+                                std::move(kernel_source));
   }
 
   return absl::UnimplementedError("Fusion kind not supported.");

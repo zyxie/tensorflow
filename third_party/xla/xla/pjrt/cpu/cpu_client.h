@@ -174,6 +174,8 @@ class PjRtCpuClient final : public CommonPjRtClient {
     return eigen_intraop_device_.get();
   }
 
+  bool IsOnCpu(PjRtMemorySpace* memory_space) override { return true; }
+
   // Returns a pair of async events:
   // - async event that signals the completion of the last collective launch
   // - count down event that must be signalled when each rank completes
@@ -191,14 +193,6 @@ class PjRtCpuClient final : public CommonPjRtClient {
     return std::make_pair(std::move(last_launch), std::move(count_down));
   }
 
-  tsl::AsyncValueRef<CpuEvent> GetLastEnqueueEvent() {
-    return last_enqueue_event_.CopyRef();
-  }
-
-  void SetLastEnqueueEvent(tsl::AsyncValueRef<CpuEvent> event) {
-    last_enqueue_event_ = std::move(event);
-  }
-
   absl::StatusOr<const xla::PjRtTopologyDescription*> GetTopologyDescription()
       const override {
     return &topology_;
@@ -206,7 +200,7 @@ class PjRtCpuClient final : public CommonPjRtClient {
 
   absl::StatusOr<tsl::RCReference<CommonPjRtRawBuffer>> AllocateRawBuffer(
       PjRtMemorySpace* memory_space, size_t on_device_bytes_count,
-      tsl::AsyncValueRef<bool> allocate_after) override;
+      bool retry_on_oom, tsl::AsyncValueRef<bool> allocate_after) override;
 
   absl::StatusOr<std::pair<tsl::RCReference<PjRtDeviceEventPromise>,
                            tsl::RCReference<PjRtDeviceEvent>>>
@@ -317,20 +311,12 @@ class PjRtCpuClient final : public CommonPjRtClient {
 
   // A callback to customize the HloModuleConfig for each compiled module.
   std::function<void(HloModuleConfig&)> customize_hlo_module_config_;
-
-  // Used to prevent too much parallelism: we will not enqueue next non-parallel
-  // computation until last one is done within each user thread.
-  // TODO(yueshengys): Consider moving the enqueuing/ordering logic to JAX via
-  // token threading.
-  inline static thread_local tsl::AsyncValueRef<CpuEvent> last_enqueue_event_ =
-      tsl::MakeAvailableAsyncValueRef<CpuEvent>();
 };
 
 class PjRtCpuBuffer final : public AbstractCpuBuffer {
  public:
   PjRtCpuBuffer(Shape on_device_shape,
                 std::unique_ptr<TrackedCpuDeviceBuffer> tracked_device_buffer,
-                PjRtCpuClient* client, PjRtCpuDevice* device,
                 PjRtMemorySpace* memory_space);
 
   PjRtCpuBuffer(const PjRtCpuBuffer&) = delete;
@@ -339,8 +325,8 @@ class PjRtCpuBuffer final : public AbstractCpuBuffer {
   PjRtCpuBuffer& operator=(PjRtCpuBuffer&&) = delete;
 
   PjRtMemorySpace* memory_space() const override { return memory_space_; }
-  PjRtCpuDevice* device() const override { return device_; }
-  PjRtCpuClient* client() const override { return client_; }
+  PjRtCpuDevice* device() const override;
+  PjRtCpuClient* client() const override;
 
   PjRtFuture<> CopyRawToHost(void* dst, int64_t offset,
                              int64_t transfer_size) override;
@@ -356,10 +342,6 @@ class PjRtCpuBuffer final : public AbstractCpuBuffer {
 
  private:
   absl::string_view buffer_name() const override { return "PjRtCpuBuffer"; }
-
-  PjRtCpuClient* client_;
-  PjRtCpuDevice* const device_;
-  PjRtMemorySpace* const memory_space_;
 };
 
 class PjRtCpuExecutable final : public PjRtLoadedExecutable {
@@ -369,7 +351,6 @@ class PjRtCpuExecutable final : public PjRtLoadedExecutable {
       std::shared_ptr<DeviceAssignment> device_assignment,
       bool parameter_is_tupled_arguments, CompileOptions compile_options,
       std::unique_ptr<Executable> cpu_executable,
-      BufferAllocation::Index result_buffer_index,
       absl::InlinedVector<BufferAllocation::Index, 4> result_buffer_indices,
       std::vector<LogicalDeviceIds> addressable_device_logical_ids,
       std::vector<PjRtDevice*> addressable_devices, PjRtCpuClient* client);
@@ -426,6 +407,8 @@ class PjRtCpuExecutable final : public PjRtLoadedExecutable {
     memory_stats.serialized_buffer_assignment = proto->SerializeAsString();
     memory_stats.PopulateBufferStatsFromAllocations(
         cpu_executable_->GetAllocations());
+    TF_ASSIGN_OR_RETURN(int64_t peak_memory, ComputePeakMemory(*proto));
+    memory_stats.peak_memory_in_bytes = peak_memory;
     return memory_stats;
   }
 
@@ -433,23 +416,26 @@ class PjRtCpuExecutable final : public PjRtLoadedExecutable {
   absl::StatusOr<std::vector<std::vector<std::unique_ptr<PjRtBuffer>>>> Execute(
       absl::Span<const std::vector<PjRtBuffer*>> argument_handles,
       const ExecuteOptions& options,
-      std::optional<std::vector<PjRtFuture<>>>& returned_futures) override;
+      std::optional<std::vector<PjRtFuture<>>>& returned_futures)
+      const override;
 
   using PjRtLoadedExecutable::ExecuteSharded;
   absl::StatusOr<std::vector<std::unique_ptr<PjRtBuffer>>> ExecuteSharded(
       absl::Span<PjRtBuffer* const> argument_handles, PjRtDevice* device,
       const ExecuteOptions& options,
-      std::optional<PjRtFuture<>>& returned_future, bool fill_future) override;
+      std::optional<PjRtFuture<>>& returned_future,
+      bool fill_future) const override;
 
   using PjRtLoadedExecutable::ExecutePortable;
   absl::StatusOr<std::vector<std::unique_ptr<PjRtBuffer>>> ExecutePortable(
       absl::Span<PjRtBuffer* const> argument_handles, PjRtDevice* device,
       const ExecuteOptions& options,
-      std::optional<PjRtFuture<>>& returned_future, bool fill_future) override;
+      std::optional<PjRtFuture<>>& returned_future,
+      bool fill_future) const override;
 
   void Delete() override;
 
-  bool IsDeleted() override;
+  bool IsDeleted() const override;
 
   absl::StatusOr<std::string> SerializeExecutable() const override;
 
@@ -482,7 +468,7 @@ class PjRtCpuExecutable final : public PjRtLoadedExecutable {
       absl::Span<PjRtBuffer* const> argument_handles, int replica,
       int partition, const RunId& run_id, const ExecuteOptions& options,
       PjRtCpuClient::CollectiveLaunchEvent last_collective_launch_event,
-      bool fill_future, PjRtCpuDevice* device = nullptr);
+      bool fill_future, PjRtCpuDevice* device = nullptr) const;
 
   PjRtCpuClient* client_;
 
@@ -494,11 +480,9 @@ class PjRtCpuExecutable final : public PjRtLoadedExecutable {
 
   std::shared_ptr<Executable> cpu_executable_;
 
-  // Caching `result_buffer_index_` and `result_buffer_indices_` to avoid lookup
+  // Caching `result_buffer_indices_` to avoid lookup
   // HLO dataflow analysis data structures in program execution critical path.
 
-  // Buffer allocation index corresponding to root buffer buffer.
-  BufferAllocation::Index result_buffer_index_;
   // Buffer allocation indices corresponding to each result buffer leaf buffer.
   absl::InlinedVector<BufferAllocation::Index, 4> result_buffer_indices_;
 

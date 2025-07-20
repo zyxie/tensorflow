@@ -1,5 +1,6 @@
-# Placeholder: load py_proto_library
 load("@llvm-project//mlir:tblgen.bzl", "gentbl_cc_library", "td_library")
+
+# Placeholder: load py_proto_library
 load("//tensorflow:tensorflow.bzl", "tf_cc_binary", "tf_cc_test")
 load("//tensorflow:tensorflow.default.bzl", "get_compatible_with_portable")
 load("//tensorflow/compiler/mlir/quantization/stablehlo:internal_visibility_allowlist.bzl", "internal_visibility_allowlist")
@@ -23,6 +24,7 @@ package(
     default_visibility = [
         ":internal_visibility_allowlist_package",
         "//tensorflow:__pkg__",
+        "//third_party/py/orbax:__subpackages__",
     ],
     licenses = ["notice"],
 )
@@ -85,13 +87,13 @@ cc_library(
         ":remove_sharding_custom_call_inc_gen",
         ":stablehlo_passes_inc_gen",
         ":stablehlo_type_utils",
+        "//tensorflow/compiler/mlir/quantization/common:attrs_and_constraints",
         "//tensorflow/compiler/mlir/quantization/common:func",
-        "//tensorflow/compiler/mlir/quantization/common:tf_attrs_and_constraints",
-        "//tensorflow/compiler/mlir/quantization/common:tf_lift_as_function_call",
+        "//tensorflow/compiler/mlir/quantization/common:lift_as_function_call",
         "//tensorflow/compiler/mlir/quantization/common:uniform_quantized_types",
         "//tensorflow/compiler/mlir/quantization/common/ir:QuantOps",
-        "//tensorflow/compiler/mlir/quantization/common/tf_quantization_lib",
-        "//tensorflow/compiler/mlir/quantization/common/tf_quantization_lib:tf_quantization_config",
+        "//tensorflow/compiler/mlir/quantization/common/quantization_lib",
+        "//tensorflow/compiler/mlir/quantization/common/quantization_lib:quantization_config",
         "//tensorflow/compiler/mlir/quantization/stablehlo/cc:permutation",
         "//tensorflow/compiler/mlir/quantization/stablehlo/ops:stablehlo_op_quant_spec",
         "//tensorflow/compiler/mlir/quantization/tensorflow:quantization_options_proto_cc",
@@ -141,17 +143,16 @@ cc_library(
     compatible_with = get_compatible_with_portable(),
     deps = [
         ":quantization_config_proto_cc",
-        "//tensorflow/compiler/mlir/quantization/common:tf_attrs_and_constraints",
-        "//tensorflow/compiler/mlir/quantization/common:tf_lift_as_function_call",
+        "//tensorflow/compiler/mlir/quantization/common:attrs_and_constraints",
+        "//tensorflow/compiler/mlir/quantization/common:lift_as_function_call",
         "//tensorflow/compiler/mlir/quantization/common:uniform_quantized_types",
         "//tensorflow/compiler/mlir/quantization/common/ir:QuantOps",
-        "//tensorflow/compiler/mlir/quantization/common/tf_quantization_lib",
+        "//tensorflow/compiler/mlir/quantization/common/quantization_lib",
         "//tensorflow/compiler/mlir/quantization/stablehlo/ops:stablehlo_op_quant_spec",
         "//tensorflow/compiler/mlir/quantization/tensorflow:quantization_options_proto_cc",
         "//tensorflow/compiler/mlir/tensorflow",
         "//tensorflow/core:protos_all_cc",
         "//tensorflow/core/platform:path",
-        "@com_google_absl//absl/container:flat_hash_set",
         "@llvm-project//llvm:Support",
         "@llvm-project//mlir:FuncDialect",
         "@llvm-project//mlir:IR",
@@ -172,7 +173,6 @@ td_library(
     ],
     compatible_with = get_compatible_with_portable(),
     deps = [
-        "//tensorflow/compiler/mlir/lite:tensorflow_lite_ops_td_files",
         "//tensorflow/compiler/mlir/quantization/common:lift_as_function_call_td_files",
         "//tensorflow/compiler/mlir/quantization/tensorflow:quant_td_files",
         "//tensorflow/compiler/mlir/tensorflow:tensorflow_ops_td_files",
@@ -256,10 +256,7 @@ cc_library(
         "passes/bridge/passes.h",
     ],
     compatible_with = get_compatible_with_portable(),
-    visibility = [
-        ":internal_visibility_allowlist_package",
-        "//tensorflow/compiler/mlir:__subpackages__",
-    ],
+    visibility = ["//visibility:public"],
     deps = [
         ":bridge_passes_inc_gen",
         ":optimize_inc_gen",
@@ -426,7 +423,7 @@ cc_library(
         "quantize_passes.h",
     ],
     compatible_with = get_compatible_with_portable(),
-    visibility = [":internal_visibility_allowlist_package"],
+    visibility = ["//visibility:public"],
     deps = [
         ":fill_quantization_options",
         ":passes",

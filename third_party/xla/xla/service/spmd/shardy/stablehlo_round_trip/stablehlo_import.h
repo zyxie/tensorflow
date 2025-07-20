@@ -18,6 +18,8 @@ limitations under the License.
 
 #include <cstdint>
 
+#include "absl/status/status.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Pass/PassManager.h"
@@ -25,6 +27,7 @@ limitations under the License.
 #include "shardy/dialect/sdy/ir/dialect.h"
 #include "xla/hlo/ir/hlo_sharding.h"
 #include "xla/hlo/ir/tile_assignment.h"
+#include "xla/util.h"
 
 namespace xla {
 namespace sdy {
@@ -41,7 +44,7 @@ mlir::sdy::TensorShardingAttr convertToSdySharding(
     const xla::HloSharding& hloSharding, mlir::sdy::MeshAttr globalMesh,
     const llvm::SmallDenseMap<int64_t, mlir::StringRef>&
         deviceIdToMaximalMeshName,
-    int64_t rank, bool openDims = false);
+    int64_t rank, bool openDims = false, bool inlineMesh = false);
 
 // Returns the axis sizes from the tile assignment. For example, given the input
 // {devices=[6,35]<=[7,10,3]T(2,1,0)}, the function returns [7, 2, 5, 3].
@@ -67,6 +70,16 @@ void registerStablehloImportPipeline();
 void addStablehloImportPipeline(mlir::OpPassManager& pm,
                                 mlir::ArrayRef<bool> allowPropagationToArgs,
                                 mlir::ArrayRef<bool> allowPropagationToResults);
+
+// Creates ImportShardingsPass that converts `mhlo.sharding` to `mesh` and
+// `sdy.sharding`.
+std::unique_ptr<mlir::Pass> createImportShardingsPass(
+    mlir::ArrayRef<bool> allowPropagationToArgs,
+    mlir::ArrayRef<bool> allowPropagationToResults);
+
+// Adds the sdy shardings to frontend attributes for each instruction of main
+// computation in the HloModule.
+absl::Status addSdyShardingsToEntryComputation(xla::HloModule* module);
 
 }  // namespace sdy
 }  // namespace xla

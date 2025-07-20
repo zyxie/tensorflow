@@ -20,6 +20,7 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "xla/tests/xla_test_backend_predicates.h"
 #include "absl/types/span.h"
 #include "xla/array.h"
 #include "xla/error_spec.h"
@@ -37,7 +38,6 @@ limitations under the License.
 #include "xla/tests/hlo_pjrt_interpreter_reference_mixin.h"
 #include "xla/tests/hlo_pjrt_test_base.h"
 #include "xla/tests/literal_test_util.h"
-#include "xla/tests/test_macros.h"
 #include "xla/tsl/lib/core/status_test_util.h"
 #include "xla/tsl/platform/statusor.h"
 #include "xla/tsl/platform/test.h"
@@ -329,10 +329,10 @@ ENTRY main {
 
 // The next 2 tests uses data types that require extra steps on some backends so
 // only run them on known good backends.
-#if defined(XLA_TEST_BACKEND_GPU) || defined(XLA_TEST_BACKEND_CPU) || \
-    defined(XLA_TEST_BACKEND_INTERPRETER)
-
 TEST_F(GatherOperationTest, OutOfBoundsIndex64Bit) {
+  if (!test::DeviceTypeIsOneOf({test::kCpu, test::kGpu, test::kInterpreter})) {
+    GTEST_SKIP();
+  }
   // Out of bounds indices must not crash, even when the value is of a type
   // larger than needed to access all values in the input, and the indices
   // produce the same values across all backends.
@@ -360,6 +360,9 @@ ENTRY main {
 }
 
 TEST_F(GatherOperationTest, TooSmallIndex8Bit) {
+  if (!test::DeviceTypeIsOneOf({test::kCpu, test::kGpu, test::kInterpreter})) {
+    GTEST_SKIP();
+  }
   // Indices of a type too small to index all locations in gather should not
   // fail.
 
@@ -387,7 +390,6 @@ ENTRY main {
   RunTest(hlo_text, &operand, &start_indices);
 }
 
-#endif
 
 TEST_F(GatherOperationTest, OutOfBoundsUnsignedIndex) {
   // Out of bounds indices must not crash, and the indices in range should
@@ -797,7 +799,8 @@ TEST_F(GatherOperationWithoutReferenceTest, Basic) {
   Literal indices_arg = LiteralUtil::CreateR1<int32_t>({0, 2});
   TF_ASSERT_OK_AND_ASSIGN(
       const Literal result_literal,
-      test_runner().Execute(std::move(module), {&operand_arg, &indices_arg}));
+      test_runner().Execute(std::move(module), {&operand_arg, &indices_arg},
+                            /*run_hlo_passes=*/true));
 
   std::vector<int32_t> expected = {};
   LiteralTestUtil::ExpectR2Equal<int32_t>({{1, 2, 3}, {7, 8, 9}},

@@ -90,7 +90,10 @@ py_strict_test(
 cc_library(
     name = "types",
     srcs = ["types.cc"],
-    hdrs = ["types.h"],
+    hdrs = [
+        "types.h",
+        "version.h",
+    ],
     compatible_with = [],
     copts = [
         "-fexceptions",
@@ -306,6 +309,7 @@ cc_library(
         "//xla/mlir/utils:error_util",
         "//xla/mlir_hlo:mhlo_passes",
         "//xla/mlir_hlo:stablehlo_extension_passes",
+        "//xla/service/spmd/shardy:utils",
         "//xla/service/spmd/shardy/round_trip_common:import_constants",
         "//xla/service/spmd/shardy/sdy_round_trip:pipelines",
         "//xla/tsl/platform:errors",

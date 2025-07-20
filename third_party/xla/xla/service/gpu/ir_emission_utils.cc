@@ -424,33 +424,36 @@ std::optional<TransposeDescription> GetDescriptionForTiledTransposeEmitter(
     return TransposeDescription{&hero, dimensions, permutation,
                                 shmem_usage_bytes};
   }
-  int64_t num_elements_after_transposed_dims = 1;
-  std::pair<int64_t, int64_t> transposed_dims;
   if (permutation.back() == dimensions.size() - 1) {
-    if (bit_width * dimensions.back() > kMaxBitsInMostMinorDimension) {
-      return std::nullopt;
+    operand_most_minor_dim =
+        hero.operand(0)->shape().dimensions(dimensions.size() - 2);
+    if (bit_width * dimensions.back() <= kMaxBitsInMostMinorDimension &&
+        bit_width * dimensions.back() *
+                std::min(operand_most_minor_dim,
+                         dimensions[dimensions.size() - 2]) >=
+            8 * kMinDimensionToTransposeTiled) {
+      // Tile size for transposition.
+      int64_t shmem_usage_bytes =
+          CeilOfRatio(kNumShmemBanks * (kNumShmemBanks + 1LL) * bit_width *
+                          dimensions.back(),
+                      8LL);
+      return TransposeDescription{&hero, dimensions, permutation,
+                                  shmem_usage_bytes};
     }
-    num_elements_after_transposed_dims = dimensions.back();
-    transposed_dims = {
-        hero.operand(0)->shape().dimensions(dimensions.size() - 2),
-        dimensions[dimensions.size() - 2]};
-  } else {
+  } else if ((operand_most_minor_dim >= kMinDimensionToTransposeTiled &&
+              dimensions.back() >= kMinDimensionToTransposeTiled) ||
+             (operand_most_minor_dim >= kMinDimensionToTransposeTiled2 &&
+              dimensions.back() >= kMinDimensionToTransposeTiled2 &&
+              operand_most_minor_dim * dimensions.back() >=
+                  kMinTotalDimensionsToTransposeTiled)) {
     // TODO(b/415741994): TransposeEmitter is regressing for S4 when the last
     // dimension is being transposed. The issue seems to be related to bank
     // conflicts but a proper investigation is needed.
     if (bit_width == 4) {
       return std::nullopt;
     }
-    transposed_dims = {operand_most_minor_dim, dimensions.back()};
-  }
-  if ((std::min(transposed_dims.first, transposed_dims.second) >=
-       kMinDimensionToTransposeTiled) &&
-      (transposed_dims.first * transposed_dims.second >=
-       kMinTotalDimensionsToTransposeTiled)) {
     int64_t shmem_usage_bytes =
-        CeilOfRatio(kNumShmemBanks * (kNumShmemBanks + 1LL) * bit_width *
-                        num_elements_after_transposed_dims,
-                    8LL);
+        CeilOfRatio(kNumShmemBanks * (kNumShmemBanks + 1LL) * bit_width, 8LL);
     return TransposeDescription{&hero, dimensions, permutation,
                                 shmem_usage_bytes};
   }
@@ -558,78 +561,6 @@ absl::StatusOr<absl::InlinedVector<int64_t, 3>> GetPackedTransposeTileSizes(
   return tile_sizes;
 }
 
-bool IsIntermediate(const HloInstruction* instr, int allowed_operand_count) {
-  // Number of operands should be in range [1, allowed_operand_count].
-  if (instr->operand_count() == 0 ||
-      instr->operand_count() > allowed_operand_count) {
-    return false;
-  }
-
-  if (instr->IsElementwise()) {
-    // All elementwise ops are considered intermediate, except for copies that
-    // modify the layout. Copies that do not modify the layout are used in
-    // CopyFusion.
-    if (instr->opcode() == HloOpcode::kCopy) {
-      return instr->shape() == instr->operand(0)->shape();
-    }
-    return true;
-  }
-
-  // `instr` is a bitcast or a bitcast-like operation.
-  switch (instr->opcode()) {
-    case HloOpcode::kBitcast:
-      return true;
-    case HloOpcode::kReshape:
-      return ShapeUtil::ReshapeIsBitcast(instr->operand(0)->shape(),
-                                         instr->shape());
-    case HloOpcode::kTranspose:
-      return ShapeUtil::TransposeIsBitcast(instr->operand(0)->shape(),
-                                           instr->shape(), instr->dimensions());
-    default:
-      return false;
-  }
-}
-
-static std::optional<HloInstructionAdaptor> FindNonTrivialHero(
-    const HloInstructionAdaptor& root,
-    const std::function<bool(const HloInstruction&)>& predicate) {
-  std::optional<HloInstructionAdaptor> hero = std::nullopt;
-  auto visitor = [&](HloInstructionAdaptor node) {
-    if (predicate(node.instruction())) {
-      if (hero) {  // Bail out if we found multiple potential heros.
-        hero = std::nullopt;
-        return TraversalResult::kInterrupt;
-      }
-      hero = node;
-      return TraversalResult::kSkip;
-    }
-
-    if (!IsIntermediate(&node.instruction(), /*allowed_operand_count=*/3)) {
-      return TraversalResult::kSkip;
-    }
-    return TraversalResult::kAdvance;
-  };
-  HloBfsConsumersFirstTraversal({root}, root.parent(), visitor);
-  if (!hero) {
-    return std::nullopt;
-  }
-
-  // Make sure that no non-elementwise op is reachable from the transpose.
-  auto is_nontrivial = [](HloInstructionAdaptor node) {
-    return node.instruction().opcode() != HloOpcode::kTuple &&
-           node.instruction().opcode() != HloOpcode::kParameter &&
-           !IsIntermediate(&node.instruction(),
-                           /*allowed_operand_count=*/3);
-  };
-  bool visit_operands = false;
-  if (HloBfsAnyOf(hero->GetUsers(), hero->parent(), is_nontrivial,
-                  visit_operands)) {
-    return std::nullopt;
-  }
-
-  return hero;
-}
-
 HloInstructionAdaptor FindNonTrivialHero(const HloInstructionAdaptor& instr) {
   HloInstructionAdaptor hero = instr;
 
@@ -647,13 +578,13 @@ HloInstructionAdaptor FindNonTrivialHero(const HloInstructionAdaptor& instr) {
   auto is_transpose = [](const HloInstruction& node) {
     return GetDescriptionForTiledTransposeEmitter(node).has_value();
   };
-  if (auto transpose = FindNonTrivialHero(hero, is_transpose)) {
+  if (auto transpose = FindHero(hero, std::move(is_transpose))) {
     return *transpose;
   }
   auto is_concatenate = [](const HloInstruction& node) {
     return node.opcode() == HloOpcode::kConcatenate;
   };
-  if (auto concatenate = FindNonTrivialHero(hero, is_concatenate)) {
+  if (auto concatenate = FindHero(hero, std::move(is_concatenate))) {
     return *concatenate;
   }
   if (hero.opcode() != HloOpcode::kReduce) {

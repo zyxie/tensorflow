@@ -20,6 +20,7 @@ limitations under the License.
 #include <new>
 #include <utility>
 
+#include "xla/tests/xla_test_backend_predicates.h"
 #include "absl/strings/str_cat.h"
 #include "absl/types/span.h"
 #include "xla/client/local_client.h"
@@ -34,7 +35,6 @@ limitations under the License.
 #include "xla/tests/client_library_test_base.h"
 #include "xla/tests/hlo_test_base.h"
 #include "xla/tests/literal_test_util.h"
-#include "xla/tests/test_macros.h"
 #include "xla/tests/test_utils.h"
 #include "xla/tsl/lib/core/status_test_util.h"
 #include "xla/xla_data.pb.h"
@@ -241,9 +241,9 @@ TEST_F(MultiOutputFusionTest, MultiOutputLoopFusionBitcastCompatibleShapes) {
 }
 
 TEST_F(MultiOutputFusionTest, MultiOutputLoopFeedingMap) {
-#ifdef XLA_TEST_BACKEND_GPU
-  GTEST_SKIP() << "Nested fusions not supported on GPU with MLIR emitters.";
-#endif
+  if (test::DeviceTypeIs(test::kGpu)) {
+    GTEST_SKIP() << "Nested fusions not supported on GPU with MLIR emitters.";
+  }
   const char* testcase = R"(
     HloModule m, is_scheduled=true
 
